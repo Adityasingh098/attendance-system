@@ -125,4 +125,22 @@ def recognize_face():
         clf = load_model_if_exists()
         if clf is None:
             return jsonify({"recognized": False, "error":"model not trained"}), 200
-        pred_label, conf = predict_with_model(clf, emb
+        pred_label, conf = predict_with_model(clf, emb)
+        if conf < 0.5:
+            return jsonify({"recognized": False, "confidence": float(conf)}), 200
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
+        row = c.fetchone()
+        name = row[0] if row else "Unknown"
+        ts = datetime.datetime.utcnow().isoformat()
+        c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)", (int(pred_label), name, ts))
+        conn.commit()
+        conn.close()
+        return jsonify({"recognized": True, "student_id": int(pred_label), "name": name, "confidence": float(conf)}), 200
+    except Exception as e:
+        app.logger.exception("recognize error")
+        return jsonify({"recognized": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(debug=True)
