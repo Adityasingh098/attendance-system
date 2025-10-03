@@ -4,43 +4,50 @@ import threading
 import sqlite3
 import datetime
 import json
-from flask import Flask, render_template, request, jsonify, send_file, abort
+from flask import Flask, render_template, request, jsonify, send_file
 from model import train_model_background, extract_embedding_for_image, MODEL_PATH
 
+# ------------------ Paths ------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
 DATASET_DIR = os.path.join(APP_DIR, "dataset")
 os.makedirs(DATASET_DIR, exist_ok=True)
-
 TRAIN_STATUS_FILE = os.path.join(APP_DIR, "train_status.json")
 
+# ------------------ Flask App ------------------
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# ---------- DB helpers ----------
+# ------------------ Database Helpers ------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS students (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    roll TEXT,
-                    class TEXT,
-                    section TEXT,
-                    reg_no TEXT,
-                    created_at TEXT
-                )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS attendance (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    student_id INTEGER,
-                    name TEXT,
-                    timestamp TEXT
-                )""")
+    # Students table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            roll TEXT,
+            class TEXT,
+            section TEXT,
+            reg_no TEXT,
+            created_at TEXT
+        )
+    """)
+    # Attendance table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER,
+            name TEXT,
+            timestamp TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
-# ---------- Train status helpers ----------
+# ------------------ Train Status Helpers ------------------
 def write_train_status(status_dict):
     with open(TRAIN_STATUS_FILE, "w") as f:
         json.dump(status_dict, f)
@@ -51,37 +58,34 @@ def read_train_status():
     with open(TRAIN_STATUS_FILE, "r") as f:
         return json.load(f)
 
-# ensure initial train status file exists
+# Ensure initial train status file exists
 write_train_status({"running": False, "progress": 0, "message": "No training yet."})
 
-# ---------- Routes ----------
+# ------------------ Routes ------------------
 @app.route("/")
 def index():
     return render_template("index.html")
 
-# Dashboard simple API for attendance stats (last 30 days)
+# Attendance stats for last 30 days
 @app.route("/attendance_stats")
 def attendance_stats():
     import pandas as pd
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT timestamp FROM attendance", conn)
     conn.close()
+    from datetime import date, timedelta
+    last_30 = [date.today() - timedelta(days=i) for i in range(29, -1, -1)]
     if df.empty:
-        from datetime import date, timedelta
-        days = [(date.today() - datetime.timedelta(days=i)).strftime("%d-%b") for i in range(29, -1, -1)]
-        return jsonify({"dates": days, "counts": [0]*30})
+        return jsonify({"dates":[d.strftime("%d-%b") for d in last_30], "counts":[0]*30})
     df['date'] = pd.to_datetime(df['timestamp']).dt.date
-    last_30 = [ (datetime.date.today() - datetime.timedelta(days=i)) for i in range(29, -1, -1) ]
-    counts = [ int(df[df['date'] == d].shape[0]) for d in last_30 ]
-    dates = [ d.strftime("%d-%b") for d in last_30 ]
-    return jsonify({"dates": dates, "counts": counts})
+    counts = [int(df[df['date']==d].shape[0]) for d in last_30]
+    return jsonify({"dates":[d.strftime("%d-%b") for d in last_30], "counts":counts})
 
-# -------- Add student (form) --------
+# Add student form
 @app.route("/add_student", methods=["GET", "POST"])
 def add_student():
     if request.method == "GET":
         return render_template("add_student.html")
-    # POST: save student metadata and return student_id
     data = request.form
     name = data.get("name","").strip()
     roll = data.get("roll","").strip()
@@ -93,16 +97,17 @@ def add_student():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.datetime.utcnow().isoformat()
-    c.execute("INSERT INTO students (name, roll, class, section, reg_no, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-              (name, roll, cls, sec, reg_no, now))
+    c.execute(
+        "INSERT INTO students (name, roll, class, section, reg_no, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, roll, cls, sec, reg_no, now)
+    )
     sid = c.lastrowid
     conn.commit()
     conn.close()
-    # create dataset folder for this student
     os.makedirs(os.path.join(DATASET_DIR, str(sid)), exist_ok=True)
     return jsonify({"student_id": sid})
 
-# -------- Upload face images (after capture) --------
+# Upload face images
 @app.route("/upload_face", methods=["POST"])
 def upload_face():
     student_id = request.form.get("student_id")
@@ -111,8 +116,7 @@ def upload_face():
     files = request.files.getlist("images[]")
     saved = 0
     folder = os.path.join(DATASET_DIR, student_id)
-    if not os.path.isdir(folder):
-        os.makedirs(folder, exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
     for f in files:
         try:
             fname = f"{datetime.datetime.utcnow().timestamp():.6f}_{saved}.jpg"
@@ -123,32 +127,32 @@ def upload_face():
             app.logger.error("save error: %s", e)
     return jsonify({"saved": saved})
 
-# -------- Train model (start background thread) --------
+# Train model (background thread)
 @app.route("/train_model", methods=["GET"])
 def train_model_route():
-    # if already running, respond accordingly
     status = read_train_status()
     if status.get("running"):
         return jsonify({"status":"already_running"}), 202
-    # reset status
     write_train_status({"running": True, "progress": 0, "message": "Starting training"})
-    # start background thread
-    t = threading.Thread(target=train_model_background, args=(DATASET_DIR, lambda p,m: write_train_status({"running": True, "progress": p, "message": m})))
+    t = threading.Thread(
+        target=train_model_background,
+        args=(DATASET_DIR, lambda p,m: write_train_status({"running": True, "progress": p, "message": m}))
+    )
     t.daemon = True
     t.start()
     return jsonify({"status":"started"}), 202
 
-# -------- Train progress (polling) --------
+# Train progress polling
 @app.route("/train_status", methods=["GET"])
 def train_status():
     return jsonify(read_train_status())
 
-# -------- Mark attendance page --------
+# Mark attendance page
 @app.route("/mark_attendance", methods=["GET"])
 def mark_attendance_page():
     return render_template("mark_attendance.html")
 
-# -------- Recognize face endpoint (POST image) --------
+# Recognize face
 @app.route("/recognize_face", methods=["POST"])
 def recognize_face():
     if "image" not in request.files:
@@ -158,22 +162,18 @@ def recognize_face():
         emb = extract_embedding_for_image(img_file.stream)
         if emb is None:
             return jsonify({"recognized": False, "error":"no face detected"}), 200
-        # attempt prediction
         from model import load_model_if_exists, predict_with_model
         clf = load_model_if_exists()
         if clf is None:
             return jsonify({"recognized": False, "error":"model not trained"}), 200
         pred_label, conf = predict_with_model(clf, emb)
-        # threshold confidence
         if conf < 0.5:
             return jsonify({"recognized": False, "confidence": float(conf)}), 200
-        # find student name
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
         row = c.fetchone()
         name = row[0] if row else "Unknown"
-        # save attendance record with timestamp
         ts = datetime.datetime.utcnow().isoformat()
         c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)", (int(pred_label), name, ts))
         conn.commit()
@@ -183,24 +183,25 @@ def recognize_face():
         app.logger.exception("recognize error")
         return jsonify({"recognized": False, "error": str(e)}), 500
 
-# -------- Attendance records & filters --------
+# Attendance record
 @app.route("/attendance_record", methods=["GET"])
 def attendance_record():
-    period = request.args.get("period", "all")  # all, daily, weekly, monthly
+    period = request.args.get("period", "all")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     q = "SELECT id, student_id, name, timestamp FROM attendance"
     params = ()
+    from datetime import date, timedelta
     if period == "daily":
-        today = datetime.date.today().isoformat()
+        today = date.today().isoformat()
         q += " WHERE date(timestamp) = ?"
         params = (today,)
     elif period == "weekly":
-        start = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+        start = (date.today() - timedelta(days=7)).isoformat()
         q += " WHERE date(timestamp) >= ?"
         params = (start,)
     elif period == "monthly":
-        start = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+        start = (date.today() - timedelta(days=30)).isoformat()
         q += " WHERE date(timestamp) >= ?"
         params = (start,)
     q += " ORDER BY timestamp DESC LIMIT 5000"
@@ -209,7 +210,7 @@ def attendance_record():
     conn.close()
     return render_template("attendance_record.html", records=rows, period=period)
 
-# -------- CSV download --------
+# Download CSV
 @app.route("/download_csv", methods=["GET"])
 def download_csv():
     conn = sqlite3.connect(DB_PATH)
@@ -226,7 +227,7 @@ def download_csv():
     mem.seek(0)
     return send_file(mem, as_attachment=True, download_name="attendance.csv", mimetype="text/csv")
 
-# -------- Students API for listing/editing --------
+# Students list
 @app.route("/students", methods=["GET"])
 def students_list():
     conn = sqlite3.connect(DB_PATH)
@@ -234,9 +235,10 @@ def students_list():
     c.execute("SELECT id, name, roll, class, section, reg_no, created_at FROM students ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
-    data = [ {"id":r[0],"name":r[1],"roll":r[2],"class":r[3],"section":r[4],"reg_no":r[5],"created_at":r[6]} for r in rows ]
+    data = [{"id":r[0],"name":r[1],"roll":r[2],"class":r[3],"section":r[4],"reg_no":r[5],"created_at":r[6]} for r in rows]
     return jsonify({"students": data})
 
+# Delete student
 @app.route("/students/<int:sid>", methods=["DELETE"])
 def delete_student(sid):
     conn = sqlite3.connect(DB_PATH)
@@ -245,13 +247,13 @@ def delete_student(sid):
     c.execute("DELETE FROM attendance WHERE student_id=?", (sid,))
     conn.commit()
     conn.close()
-    # also delete dataset folder
     folder = os.path.join(DATASET_DIR, str(sid))
     if os.path.isdir(folder):
         import shutil
         shutil.rmtree(folder, ignore_errors=True)
     return jsonify({"deleted": True})
 
-# ---------------- run ------------------------
+# ------------------ Run ------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Render assigns PORT dynamically
+    app.run(host="0.0.0.0", port=port, debug=False)
